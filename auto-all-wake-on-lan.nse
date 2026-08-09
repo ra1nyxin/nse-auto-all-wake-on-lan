@@ -48,6 +48,31 @@ local BROADCAST_MAC = string.rep("\255", 6)
 local ZERO_MAC = string.rep("\0", 6)
 local MAX_AUTO_HOSTS = 65534
 
+-- Paste the banner artwork between these markers. Keep it ASCII-only if the
+-- script is intended to run on older Nmap/Lua installations.
+local BANNER = [[
+
+
+
+
+
+
+
+
+
+
+
+
+
+]]
+local banner_shown = false
+
+local function show_banner()
+  if banner_shown then return end
+  banner_shown = true
+  nmap.log_write("stdout", BANNER .. "\n")
+end
+
 local function registry()
   nmap.registry[SCRIPT] = nmap.registry[SCRIPT] or {
     candidates = {},
@@ -345,6 +370,7 @@ local function summary(messages, sent)
 end
 
 prerule = function()
+  show_banner()
   return nmap.is_privileged() and nmap.address_family() == "inet"
 end
 
