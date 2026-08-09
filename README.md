@@ -1,6 +1,4 @@
-# nse-auto-all-wake-on-lan
-
-一个零配置优先、偏激进的 Nmap NSE 脚本：自动收集直连局域网内可获得的 MAC 地址，并向每个候选设备发送 Wake-on-LAN（WOL）魔术包。
+<img width="100%" height="100%" alt="ボーカロイドは不滅だ" src="https://github.com/user-attachments/assets/2f6d2e5a-badc-4d1e-a193-1bbd742e5a79" />
 
 > 警告：本脚本会尝试改变局域网设备的电源状态。Nmap 没有正式的 `nosafe` 分类；本脚本使用 `intrusive`，并且明确不声明 `safe`，等价于项目所要求的 nosafe 定位。只应在你拥有或获授权管理的网络中运行。
 
@@ -34,8 +32,6 @@ sudo install -m 0644 auto-all-wake-on-lan.nse /path/to/nmap-data/scripts/
 sudo nmap --script-updatedb
 sudo nmap --script auto-all-wake-on-lan
 ```
-
-`sudo` 不是装饰：ARP、LLTD 抓包和原始二层 WOL 帧均需要原始套接字权限。
 
 ## 默认做什么
 
