@@ -47,8 +47,11 @@ sudo nmap --script auto-all-wake-on-lan
 |---|---|
 | Nmap `host.mac_addr` | 在同次 `-sn -PR` 或其他本地扫描中识别出的主机 |
 | 原始 ARP sweep | 直接相连、此刻会回应 ARP 的 IPv4 主机 |
+| OS 邻居缓存 | Linux `/proc/net/arp`、Windows/macOS/BSD 的 `arp -a` |
 | 被动 Ethernet 抓包 | 发现等待窗口内产生任意局域网帧的设备 |
 | LLTD Quick Discovery | 支持并回应 Microsoft LLTD 的局域网设备 |
+| mDNS / SSDP / LLMNR / WSD | 响应对应局域网发现探测的设备 |
+| SNMP Bridge-MIB FDB | 仅在显式提供 SNMP 主机和凭据时查询交换机 MAC 表 |
 | Linux ARP 缓存 | 本机近期访问过、缓存尚未过期的邻居 |
 
 对每一个候选 MAC，脚本经三种传输方式各发送 **4 次**：
@@ -69,18 +72,21 @@ sudo nmap --script auto-all-wake-on-lan
 | `auto-all-wake-on-lan.repeat=3` | `4` | 每种传输的重复次数，仅接受 3 到 4 |
 | `auto-all-wake-on-lan.timeout=3s` | `2s` | 每个发现阶段的收包时长 |
 | `auto-all-wake-on-lan.max-hosts=4096` | `65534` | 限制自动 ARP sweep 的单接口地址数 |
+| `auto-all-wake-on-lan.snmp-host=192.168.1.1` | 未启用 | 查询标准 Bridge-MIB FDB；不会默认探测 SNMP |
+| `auto-all-wake-on-lan.snmp-community=...` | `public` | 显式启用 SNMP FDB 时使用的 v1/v2c community |
+| `auto-all-wake-on-lan.snmp-version=v2c` | `v2c` | SNMP 版本，可选 `v1` 或 `v2c` |
 
 ## 能力边界
 
 WOL 魔术包必须包含目标 MAC，协议没有“唤醒全部设备”的通配符。一个从未出现在本机 ARP 缓存、当前完全不回应 ARP/LLTD、且没有被本次 Nmap 扫描识别的睡眠设备，无法仅靠局域网广播推导出其 MAC。
 
-路由器 DHCP 租约表、受管交换机的 FDB/MAC 表通常能补足这类设备，但它们没有跨厂商、无认证的统一查询协议；本项目不会猜测管理密码或枚举路由器凭据。若将来加入这类来源，会采用显式的、带认证的厂商适配器。
+路由器 DHCP 租约表、UPnP 客户端清单和家庭路由器厂商 API 没有跨厂商、无认证的统一查询协议；本项目不会猜测管理密码或枚举路由器凭据。SNMP FDB 已通过显式参数支持标准 Bridge-MIB；DHCP、UPnP 客户端表和厂商 API 后续只能采用具体型号的、带认证的适配器。
 
 ## 兼容性
 
 核心功能仅使用 Nmap NSE 标准库的原始以太网、pcap 和接口 API，不依赖 Debian 或 Linux 特有命令，可用于 Nmap 支持这些能力的 Linux、macOS、BSD 和 Windows 环境。
 
-Linux 上会额外读取 `/proc/net/arp` 作为候选来源；该文件不存在或不可读时会自动跳过，不影响 ARP、LLTD、Nmap 主机发现和 WOL 发送。
+Linux 上会额外读取 `/proc/net/arp`，Windows/macOS/BSD 会尝试读取系统 `arp -a` 输出；这些来源不可用时会自动跳过，不影响 ARP、LLTD、局域网协议发现、Nmap 主机发现和 WOL 发送。
 
 要求：Nmap 7.80+、IPv4、已启用的以太网接口，以及管理员/root 权限。Wi-Fi 驱动、虚拟网卡和交换机策略可能禁止原始二层帧或广播，这属于所在网络的限制。
 

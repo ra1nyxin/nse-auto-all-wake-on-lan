@@ -1,5 +1,7 @@
 local ipOps = require "ipOps"
 local nmap = require "nmap"
+local packet = require "packet"
+local snmp_ok, snmp = pcall(require, "snmp")
 local stdnse = require "stdnse"
 local string = require "string"
 local table = require "table"
@@ -9,9 +11,9 @@ Aggressively discovers MAC addresses on directly connected IPv4 Ethernet
 networks and sends Wake-on-LAN magic packets to every unique address found.
 
 The script needs no arguments by default. It obtains candidates from Nmap host
-discovery, an ARP sweep, passive Ethernet traffic, LLTD replies, and, on Linux,
-the local ARP cache. Each candidate receives four raw Ethernet WoL frames, four
-directed UDP broadcasts, and four limited UDP broadcasts.
+discovery, ARP and OS neighbor caches, passive Ethernet traffic, LLTD, mDNS,
+SSDP, LLMNR, and WSD replies. Each candidate receives four raw Ethernet WoL
+frames, four directed UDP broadcasts, and four limited UDP broadcasts.
 
 This script changes remote device power state. It is deliberately not in the
 safe category and must be run with privileges.
@@ -30,13 +32,19 @@ safe category and must be run with privileges.
 --       broadcasts. Defaults to 2s.
 -- @args auto-all-wake-on-lan.max-hosts Maximum addresses for an automatic ARP
 --       sweep on one interface. Defaults to 65534.
+-- @args auto-all-wake-on-lan.snmp-host Optional SNMP host to query for a
+--       standard Bridge-MIB forwarding database.
+-- @args auto-all-wake-on-lan.snmp-community SNMPv1/v2c community for the FDB
+--       query. Only used when snmp-host is explicitly set.
+-- @args auto-all-wake-on-lan.snmp-version SNMP version, v1 or v2c (default v2c).
+-- @args auto-all-wake-on-lan.snmp-port UDP port (default 161).
 --
 -- @output
 -- Pre-scan script results:
 -- | auto-all-wake-on-lan:
 -- |   Interfaces: eth0 (192.168.1.0/24)
 -- |   MAC candidates: 12
--- |   Candidate sources: arp-cache=3, arp-sweep=8, lltd=1
+-- |   Candidate sources: arp-cache=3, arp-sweep=8, mdns=2, ssdp=1
 -- |_  Sent 144 magic packets (3 transports x 4 repeats x 12 MACs)
 
 author = "rainyxin"
@@ -276,18 +284,186 @@ local function discover_passive(iface, timeout_ms, messages)
   end
 end
 
-local function discover_linux_arp_cache(interfaces)
+local function dns_name(labels)
+  local encoded = {}
+  for _, label in ipairs(labels) do
+    encoded[#encoded + 1] = string.char(#label) .. label
+  end
+  return table.concat(encoded) .. "\0"
+end
+
+local function mdns_query()
+  return string.pack(">I2I2I2I2I2I2", 0x4242, 0, 1, 0, 0, 0)
+    .. dns_name({"_services", "_dns-sd", "_udp", "local"})
+    .. string.pack(">I2I2", 12, 1)
+end
+
+local function llmnr_query()
+  return string.pack(">I2I2I2I2I2I2", 0x4243, 0, 1, 0, 0, 0)
+    .. dns_name({"wpad"}) .. string.pack(">I2I2", 1, 1)
+end
+
+local function wsd_probe()
+  return [[<?xml version="1.0" encoding="utf-8"?>
+<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
+ xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+ xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">
+<e:Header><w:MessageID>urn:uuid:42424242-4242-4242-4242-424242424242</w:MessageID>
+<w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To>
+<w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action>
+</e:Header><e:Body><d:Probe/></e:Body></e:Envelope>]]
+end
+
+local function ssdp_probe()
+  local crlf = string.char(13, 10)
+  return table.concat({
+    "M-SEARCH * HTTP/1.1", crlf,
+    "HOST: 239.255.255.250:1900", crlf,
+    "MAN: \"ssdp:discover\"", crlf,
+    "MX: 1", crlf,
+    "ST: ssdp:all", crlf, crlf,
+  })
+end
+
+local function send_discovery_probe(address, port, payload)
+  local ok, sent = pcall(function()
+    local socket = nmap.new_socket("udp")
+    local status = socket:sendto({ ip = address }, { number = port, protocol = "udp" }, payload)
+    socket:close()
+    return status
+  end)
+  return ok and sent
+end
+
+local function discover_lan_protocols(iface, timeout_ms, messages)
+  local pcap = nmap.new_socket()
+  local ok, err = pcall(function()
+    pcap:pcap_open(iface.device, 256, false,
+      "udp and (udp src port 5353 or udp src port 1900 or udp src port 5355 or udp src port 3702)")
+    pcap:set_timeout(100)
+    stdnse.sleep(0.1)
+
+    local probes = {
+      { address = "224.0.0.251", port = 5353, payload = mdns_query() },
+      { address = "239.255.255.250", port = 1900, payload = ssdp_probe() },
+      { address = "224.0.0.252", port = 5355, payload = llmnr_query() },
+      { address = "239.255.255.250", port = 3702, payload = wsd_probe() },
+    }
+    for _, probe in ipairs(probes) do
+      send_discovery_probe(probe.address, probe.port, probe.payload)
+    end
+
+    local deadline = nmap.clock_ms() + timeout_ms
+    while nmap.clock_ms() < deadline do
+      local status, _, l2, l3 = pcap:pcap_receive()
+      if status and l2 and #l2 >= 12 then
+        local source = "lan-discovery"
+        if l3 and #l3 > 0 then
+          local parsed = packet.Packet:new(l3, #l3)
+          if parsed and parsed.udp_sport == 5353 then source = "mdns"
+          elseif parsed and parsed.udp_sport == 1900 then source = "ssdp"
+          elseif parsed and parsed.udp_sport == 5355 then source = "llmnr"
+          elseif parsed and parsed.udp_sport == 3702 then source = "wsd" end
+        end
+        candidate(l2:sub(7, 12), iface, source)
+      end
+    end
+  end)
+  pcall(function() pcap:close() end)
+  if not ok then
+    table.insert(messages, ("%s: LAN protocol discovery failed: %s"):format(iface.device, tostring(err)))
+  end
+end
+
+local function discover_os_neighbor_cache(interfaces)
   local by_device = {}
+  local by_address = {}
   for _, iface in ipairs(interfaces) do by_device[iface.device] = iface end
+  for _, iface in ipairs(interfaces) do by_address[iface.address] = iface end
+
+  -- Linux exposes a stable, command-free cache. On other systems this file
+  -- is absent, so the portable command fallback below remains authoritative.
   local file = io.open("/proc/net/arp", "r")
-  if not file then return end
-  for line in file:lines() do
-    local _, flags, mac, device = line:match("^(%S+)%s+(0x%x+)%s+(%S+)%s+(%S+)")
-    if flags and mac and device and (tonumber(flags) or 0) % 4 >= 2 then
-      candidate(mac, by_device[device], "arp-cache")
+  if file then
+    for line in file:lines() do
+      local _, flags, mac, device = line:match("^(%S+)%s+(0x%x+)%s+(%S+)%s+(%S+)")
+      if flags and mac and device and (tonumber(flags) or 0) % 4 >= 2 then
+        candidate(mac, by_device[device], "arp-cache")
+      end
+    end
+    file:close()
+  end
+
+  -- Windows (arp -a) and macOS/BSD (arp -an) use different text layouts, but
+  -- both expose an IP followed by a six-octet MAC. Keep the parser layout-free
+  -- and use interface headers / "on <device>" hints when available.
+  local popen_ok, command = pcall(io.popen, "arp -a")
+  if not popen_ok then command = nil end
+  if not command then return end
+  local current_iface
+  local mac_pattern = "([%x][%x][:%-][%x][%x][:%-][%x][%x][:%-][%x][%x][:%-][%x][%x][:%-][%x][%x])"
+  for line in command:lines() do
+    local header_ip = line:match("^[Ii]nterface:%s*([%d%.]+)")
+    if header_ip then current_iface = by_address[header_ip] end
+
+    local ip, mac = line:match("(%d+%.%d+%.%d+%.%d+).*" .. mac_pattern)
+    if ip and mac then
+      local device = line:match("%s[oO]n%s+([%w_.%-]+)")
+      candidate(mac, by_device[device] or current_iface, "os-neighbor-cache")
     end
   end
-  file:close()
+  command:close()
+end
+
+local function discover_snmp_fdb(interfaces, messages)
+  local host = stdnse.get_script_args(SCRIPT .. ".snmp-host")
+  if not host or not snmp_ok then return end
+
+  local port = tonumber(stdnse.get_script_args(SCRIPT .. ".snmp-port")) or 161
+  local community = stdnse.get_script_args(SCRIPT .. ".snmp-community") or "public"
+  local version = stdnse.get_script_args(SCRIPT .. ".snmp-version") or "v2c"
+  local helper = snmp.Helper:new(
+    { ip = host },
+    { number = port, protocol = "udp" },
+    community,
+    { timeout = 3000, version = version })
+  local connected, err = helper:connect()
+  if not connected then
+    table.insert(messages, ("SNMP FDB connection failed: %s"):format(tostring(err)))
+    return
+  end
+
+  -- dot1dTpFdbAddress: the final six OID components are the bridge MAC.
+  local status, rows = helper:walk("1.3.6.1.2.1.17.4.3.1.1")
+  if not status or not rows then
+    table.insert(messages, "SNMP Bridge-MIB FDB walk failed")
+    if helper.socket then helper.socket:close() end
+    return
+  end
+
+  for _, row in ipairs(rows) do
+    local suffix = row.oid and row.oid:match("(%d+%.%d+%.%d+%.%d+%.%d+%.%d+)$")
+    local bytes = {}
+    if suffix then
+      for octet in suffix:gmatch("%d+") do bytes[#bytes + 1] = tonumber(octet) end
+    end
+    local mac
+    if #bytes == 6 then
+      local valid = true
+      for _, octet in ipairs(bytes) do if octet > 255 then valid = false end end
+      if valid then mac = string.char(table.unpack(bytes)) end
+    elseif row.value then
+      mac = row.value
+    end
+    -- An FDB can contain devices behind an uplink, so try every local
+    -- Ethernet interface rather than guessing one interface from the table.
+    if mac then
+      for _, iface in ipairs(interfaces) do
+        candidate(mac, iface, "snmp-fdb")
+      end
+    end
+  end
+  if helper.socket then helper.socket:close() end
 end
 
 local function wol_payload(mac)
@@ -401,10 +577,12 @@ action = function(host)
     return stdnse.format_output(false, "No active IPv4 Ethernet interface found")
   end
 
-  discover_linux_arp_cache(interfaces)
+  discover_os_neighbor_cache(interfaces)
+  discover_snmp_fdb(interfaces, messages)
   for _, iface in ipairs(interfaces) do
     discover_arp(iface, timeout * 1000, max_hosts, messages)
     discover_lltd(iface, timeout * 1000, messages)
+    discover_lan_protocols(iface, timeout * 1000, messages)
     discover_passive(iface, timeout * 1000, messages)
   end
   return summary(messages, wake_all(repeats))
