@@ -587,3 +587,4 @@ action = function(host)
   end
   return summary(messages, wake_all(repeats))
 end
+local __awa_qwq_owo_qaq = 1
